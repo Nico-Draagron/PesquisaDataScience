@@ -325,14 +325,44 @@ with tabs[1]:
     with col2:
         st.subheader("Vendas por Mês")
         if "mes" in df_filtrado.columns and "valor_total" in df_filtrado.columns:
+            # Agrupa vendas por mês
             vendas_mes = df_filtrado.groupby("mes")["valor_total"].agg(['sum', 'mean']).reset_index()
+            
+            # Cria DataFrame com todos os meses (1-12) para garantir continuidade
+            meses_completos = pd.DataFrame({"mes": range(1, 13)})
+            vendas_mes_completo = meses_completos.merge(vendas_mes, on="mes", how="left").fillna(0)
+            
+            # Adiciona nomes dos meses em português
+            meses_nomes = {
+                1: "Jan", 2: "Fev", 3: "Mar", 4: "Abr", 5: "Mai", 6: "Jun",
+                7: "Jul", 8: "Ago", 9: "Set", 10: "Out", 11: "Nov", 12: "Dez"
+            }
+            vendas_mes_completo["mes_nome"] = vendas_mes_completo["mes"].map(meses_nomes)
+            
+            # Debug: mostra dados de cada mês
+            st.write("📋 **Resumo por Mês:**")
+            debug_col1, debug_col2 = st.columns(2)
+            with debug_col1:
+                st.write("Dados originais:")
+                st.dataframe(vendas_mes_completo[["mes", "mes_nome", "sum"]].rename(columns={"sum": "Total"}), hide_index=True)
+            with debug_col2:
+                meses_com_dados = df_filtrado["mes"].value_counts().sort_index()
+                st.write("Registros por mês:")
+                st.dataframe(pd.DataFrame({"Mês": meses_com_dados.index, "Registros": meses_com_dados.values}), hide_index=True)
+            
             fig = px.bar(
-                vendas_mes, 
-                x="mes", 
+                vendas_mes_completo, 
+                x="mes_nome", 
                 y="sum",
                 title="Faturamento Total por Mês",
-                labels={"sum": "Faturamento Total (R$)", "mes": "Mês"}
+                labels={"sum": "Faturamento Total (R$)", "mes_nome": "Mês"},
+                text="sum"
             )
+            
+            # Formata valores no gráfico
+            fig.update_traces(texttemplate='%{text:,.0f}', textposition='outside')
+            fig.update_layout(showlegend=False)
+            
             st.plotly_chart(fig, use_container_width=True)
 
 # === ABA 3: ANÁLISE CLIMÁTICA ===
@@ -424,6 +454,36 @@ with tabs[3]:
 # === ABA 5: INSIGHTS AVANÇADOS ===
 with tabs[4]:
     st.header("🔍 Insights e Análises Avançadas")
+    
+    # Debug adicional para investigar problema do mês 11
+    with st.expander("🔍 Debug - Análise de Dados por Mês"):
+        if "mes" in df_filtrado.columns:
+            debug_mensal = df_filtrado.groupby("mes").agg({
+                "valor_total": ["count", "sum", "mean"],
+                "data": ["min", "max"]
+            }).round(2)
+            debug_mensal.columns = ["Qtd_Registros", "Total_Vendas", "Media_Vendas", "Data_Min", "Data_Max"]
+            st.dataframe(debug_mensal)
+            
+            # Verifica especificamente novembro
+            dados_nov = df_filtrado[df_filtrado["mes"] == 11]
+            st.write(f"**Registros em Novembro (mês 11):** {len(dados_nov)}")
+            
+            if len(dados_nov) > 0:
+                st.write("Primeiras 5 linhas de novembro:")
+                st.dataframe(dados_nov.head()[["data", "valor_total", "mes"]])
+            else:
+                st.warning("⚠️ Nenhum registro encontrado para novembro nos dados filtrados!")
+                
+                # Verifica se existe novembro nos dados originais
+                dados_nov_original = df[df["mes"] == 11] if "mes" in df.columns else pd.DataFrame()
+                st.write(f"**Registros de novembro nos dados originais:** {len(dados_nov_original)}")
+                
+                if len(dados_nov_original) > 0:
+                    st.info("💡 Novembro existe nos dados originais, mas foi removido pelos filtros aplicados.")
+                    st.write("Range de datas em novembro (dados originais):")
+                    st.write(f"- Mínima: {dados_nov_original['data'].min()}")
+                    st.write(f"- Máxima: {dados_nov_original['data'].max()}")
     
     # Top 10 melhores e piores dias
     col1, col2 = st.columns(2)
