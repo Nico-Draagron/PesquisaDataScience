@@ -1,562 +1,737 @@
 import pandas as pd
 import numpy as np
-import re
-from datetime import datetime, timedelta
 import warnings
+from datetime import datetime, timedelta
+import joblib
+import json
+from pathlib import Path
 warnings.filterwarnings('ignore')
 
-# Bibliotecas para detecção de anomalias
-from sklearn.ensemble import IsolationForest
-from sklearn.neighbors import LocalOutlierFactor
-from sklearn.preprocessing import StandardScaler
-from pyod.models.knn import KNN
-from pyod.models.lof import LOF
-from pyod.models.ocsvm import OCSVM
+# Bibliotecas de ML
+from sklearn.ensemble import (RandomForestRegressor, GradientBoostingRegressor, 
+                             ExtraTreesRegressor, VotingRegressor)
+from sklearn.linear_model import (LinearRegression, Ridge, Lasso, ElasticNet)
+from sklearn.svm import SVR
+from sklearn.neural_network import MLPRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error, r2_score
+from sklearn.preprocessing import StandardScaler, MinMaxScaler, RobustScaler
+from sklearn.utils import resample
 
-# Bibliotecas para modelagem preditiva
-from sklearn.model_selection import train_test_split, GridSearchCV
-from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
-from sklearn.linear_model import LinearRegression
-from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.preprocessing import LabelEncoder
+# Bibliotecas avançadas (opcionais)
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
 
-# Bibliotecas para visualização
-import matplotlib.pyplot as plt
-import seaborn as sns
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.express as px
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
 
-# Para dados climáticos (simulação)
-import requests
-import json
-
-class BusinessAnalyticsPipeline:
+class ModeloVendasBootstrap:
     """
-    Pipeline automatizado para análise de negócios com detecção de anomalias
-    e predição baseada em dados operacionais e climáticos.
+    Modelo de machine learning para predição de vendas com:
+    - Bootstrap resampling para lidar com poucos dados
+    - Variáveis específicas: dia semana, temperatura (min, média, max), chuva e radiação
+    - Métricas: RMSE e R²
+    - Importância das features
     """
     
-    def __init__(self):
-        self.operational_data = None
-        self.weather_data = None
-        self.unified_data = None
-        self.anomaly_detectors = {}
-        self.predictive_models = {}
-        self.column_mapping = {}
-        self.scaler = StandardScaler()
+    def __init__(self, config=None):
+        self.config = config or self._get_default_config()
+        self.modelos = {}
+        self.ensemble_model = None
+        self.scaler = None
+        self.feature_names = None
+        self.bootstrap_models = []
+        self.bootstrap_scores = []
+        self.metricas_finais = {}
+        self.importancia_features = {}  # Nova adição
         
-        # Padrões para reconhecimento automático de colunas
-        self.column_patterns = {
-            'valor_total': [
-                r'valor.*total', r'total.*valor', r'receita', r'faturamento',
-                r'vendas.*valor', r'valor.*vendas', r'revenue', r'sales.*amount'
-            ],
-            'valor_medio': [
-                r'valor.*m[eé]dio', r'ticket.*m[eé]dio', r'avg.*valor',
-                r'average.*value', r'mean.*value', r'valor.*unit[aá]rio'
-            ],
-            'num_pedidos': [
-                r'n[uú]mero.*pedidos', r'qtd.*pedidos', r'quantidade.*pedidos',
-                r'num.*orders', r'order.*count', r'pedidos', r'orders'
-            ],
-            'quebra_caixa': [
-                r'quebra.*caixa', r'cash.*break', r'deficit.*caixa',
-                r'falta.*caixa', r'shortage'
-            ],
-            'data': [
-                r'data', r'date', r'dt', r'timestamp', r'time'
-            ]
+    def _get_default_config(self):
+        """Configuração padrão do modelo"""
+        return {
+            'test_size': 0.2,
+            'random_state': 42,
+            'n_bootstrap': 100,  # Número de amostras bootstrap
+            'bootstrap_sample_size': 1.0,  # Proporção do tamanho original
+            'scaling_method': 'standard',
+            'ensemble_voting': 'soft'
         }
     
-    def detect_and_standardize_columns(self, df):
+    def preparar_features(self, df, modo_treino=True):
         """
-        Detecta automaticamente colunas baseado em padrões e padroniza nomes.
+        Prepara features específicas.
+        Se `modo_treino=True`, exige coluna 'valor_total'.
         """
-        print("🔍 Detectando e padronizando colunas...")
-        
-        detected_columns = {}
-        
-        for standard_name, patterns in self.column_patterns.items():
-            for col in df.columns:
-                col_lower = col.lower().strip()
-                for pattern in patterns:
-                    if re.search(pattern, col_lower, re.IGNORECASE):
-                        detected_columns[col] = standard_name
-                        break
-                if col in detected_columns:
-                    break
-        
-        # Renomear colunas detectadas
-        df_standardized = df.rename(columns=detected_columns)
-        self.column_mapping = detected_columns
-        
-        print(f"✅ Colunas detectadas e mapeadas: {detected_columns}")
-        return df_standardized
-    
-    def load_operational_data(self, data_source):
-        """
-        Carrega dados operacionais de diferentes fontes.
-        """
-        print("📊 Carregando dados operacionais...")
-        
-        if isinstance(data_source, str):
-            # Carregar de arquivo
-            if data_source.endswith('.csv'):
-                df = pd.read_csv(data_source)
-            elif data_source.endswith('.xlsx') or data_source.endswith('.xls'):
-                df = pd.read_excel(data_source)
-            else:
-                raise ValueError("Formato de arquivo não suportado")
-        elif isinstance(data_source, pd.DataFrame):
-            df = data_source.copy()
+        print("🔧 Preparando features específicas...")
+        df = df.copy()
+        df['data'] = pd.to_datetime(df['data'])
+        df = df.sort_values('data').reset_index(drop=True)
+
+        df['dia_semana'] = df['data'].dt.dayofweek
+
+        df_features = pd.DataFrame()
+        df_features['dia_semana'] = df['dia_semana']
+
+        # Temperaturas
+        if 'temp_min' in df.columns:
+            df_features['temp_min'] = df['temp_min']
+        if 'temp_media' in df.columns:
+            df_features['temp_media'] = df['temp_media']
+        if 'temp_max' in df.columns:
+            df_features['temp_max'] = df['temp_max']
+
+        # Chuva
+        if 'precipitacao_total' in df.columns:
+            df_features['chuva'] = df['precipitacao_total']
+
+        # Radiação
+        if 'radiacao' in df.columns:
+            df_features['radiacao'] = df['radiacao']
         else:
-            raise ValueError("Fonte de dados inválida")
-        
-        # Detectar e padronizar colunas
-        df = self.detect_and_standardize_columns(df)
-        
-        # Converter coluna de data
-        date_cols = [col for col in df.columns if 'data' in col.lower() or 'date' in col.lower()]
-        if date_cols:
-            df[date_cols[0]] = pd.to_datetime(df[date_cols[0]], errors='coerce')
-            df = df.rename(columns={date_cols[0]: 'data'})
-        
-        self.operational_data = df
-        print(f"✅ Dados operacionais carregados: {df.shape[0]} registros, {df.shape[1]} colunas")
-        return df
-    
-    def generate_weather_data(self, start_date, end_date):
-        """
-        Gera dados climáticos sintéticos para o período especificado.
-        Em produção, isso se conectaria a uma API real como OpenWeatherMap.
-        """
-        print("🌤️ Gerando dados climáticos sintéticos...")
-        
-        date_range = pd.date_range(start=start_date, end=end_date, freq='D')
-        
-        # Simulação de dados climáticos com padrões sazonais
-        np.random.seed(42)
-        weather_data = []
-        
-        for date in date_range:
-            # Padrões sazonais básicos
-            day_of_year = date.dayofyear
-            seasonal_temp = 25 + 10 * np.sin(2 * np.pi * day_of_year / 365)
-            
-            weather_data.append({
-                'data': date,
-                'temperatura': seasonal_temp + np.random.normal(0, 5),
-                'umidade': max(30, min(90, 60 + np.random.normal(0, 15))),
-                'chuva': max(0, np.random.exponential(2) if np.random.random() < 0.3 else 0),
-                'vento': max(0, np.random.normal(15, 5)),
-                'pressao': 1013 + np.random.normal(0, 20)
-            })
-        
-        self.weather_data = pd.DataFrame(weather_data)
-        print(f"✅ Dados climáticos gerados: {len(weather_data)} registros")
-        return self.weather_data
-    
-    def unify_temporal_data(self):
-        """
-        Unifica dados operacionais e climáticos por data.
-        """
-        print("📅 Unificando dados temporais...")
-        
-        if self.operational_data is None:
-            raise ValueError("Dados operacionais não carregados")
-        
-        # Agrupar dados operacionais por dia
-        if 'data' in self.operational_data.columns:
-            daily_ops = self.operational_data.groupby('data').agg({
-                col: 'sum' if col in ['valor_total', 'num_pedidos'] else 'mean'
-                for col in self.operational_data.columns if col != 'data'
-            }).reset_index()
-        else:
-            raise ValueError("Coluna de data não encontrada nos dados operacionais")
-        
-        # Gerar dados climáticos se não existirem
-        if self.weather_data is None:
-            start_date = daily_ops['data'].min()
-            end_date = daily_ops['data'].max()
-            self.generate_weather_data(start_date, end_date)
-        
-        # Unificar dados
-        unified = pd.merge(daily_ops, self.weather_data, on='data', how='left')
-        
-        # Preencher valores ausentes
-        unified = unified.fillna(method='ffill').fillna(method='bfill')
-        
-        # Adicionar features temporais
-        unified['dia_semana'] = unified['data'].dt.dayofweek
-        unified['mes'] = unified['data'].dt.month
-        unified['dia_mes'] = unified['data'].dt.day
-        unified['trimestre'] = unified['data'].dt.quarter
-        unified['fim_semana'] = (unified['dia_semana'] >= 5).astype(int)
-        
-        self.unified_data = unified
-        print(f"✅ Dados unificados: {unified.shape[0]} registros, {unified.shape[1]} colunas")
-        return unified
-    
-    def detect_anomalies(self, contamination=0.1):
-        """
-        Detecta anomalias usando múltiplos algoritmos.
-        """
-        print("🚨 Detectando anomalias...")
-        
-        if self.unified_data is None:
-            raise ValueError("Execute unify_temporal_data() primeiro")
-        
-        # Selecionar features numéricas para detecção de anomalias
-        numeric_cols = self.unified_data.select_dtypes(include=[np.number]).columns
-        features = self.unified_data[numeric_cols].fillna(0)
-        
-        # Normalizar dados
-        features_scaled = self.scaler.fit_transform(features)
-        
-        # Múltiplos detectores de anomalia
-        detectors = {
-            'IsolationForest': IsolationForest(contamination=contamination, random_state=42),
-            'LocalOutlierFactor': LocalOutlierFactor(contamination=contamination),
-            'KNN': KNN(contamination=contamination),
-            'OCSVM': OCSVM(contamination=contamination)
-        }
-        
-        anomaly_results = {}
-        
-        for name, detector in detectors.items():
-            print(f"  Executando {name}...")
-            
-            if name == 'LocalOutlierFactor':
-                anomalies = detector.fit_predict(features_scaled)
+            df_features['radiacao'] = np.random.uniform(15, 30, len(df))
+
+        # Apenas se for treino: adicionar o target
+        if modo_treino:
+            if 'valor_total' in df.columns:
+                df_features['valor_total'] = df['valor_total']
             else:
-                detector.fit(features_scaled)
-                anomalies = detector.predict(features_scaled)
-            
-            # Converter para formato binário (1 = normal, -1 = anomalia)
-            anomaly_results[name] = (anomalies == -1).astype(int)
-        
-        # Criar score de consenso
-        anomaly_df = pd.DataFrame(anomaly_results)
-        self.unified_data['anomalia_score'] = anomaly_df.mean(axis=1)
-        self.unified_data['is_anomalia'] = (self.unified_data['anomalia_score'] > 0.5).astype(int)
-        
-        anomaly_count = self.unified_data['is_anomalia'].sum()
-        print(f"✅ Detecção concluída: {anomaly_count} anomalias detectadas ({anomaly_count/len(self.unified_data)*100:.1f}%)")
-        
-        return self.unified_data[self.unified_data['is_anomalia'] == 1]
+                raise ValueError("Coluna 'valor_total' não encontrada")
+
+        df_features['data'] = df['data']
+        df_features = df_features.dropna()
+
+        print(f"✅ Features preparadas: {df_features.shape[0]} amostras")
+        return df_features
+
+    def _modelo_tem_feature_importance(self, modelo):
+        """Verifica se o modelo tem capacidade de calcular importância das features"""
+        return hasattr(modelo, 'feature_importances_')
     
-    def train_predictive_models(self, target_columns=None):
+    def _calcular_importancia_features(self, modelos_bootstrap, nome_modelo):
         """
-        Treina modelos preditivos para métricas de interesse.
+        Calcula a importância das features para modelos que suportam
         """
-        print("🤖 Treinando modelos preditivos...")
-        
-        if self.unified_data is None:
-            raise ValueError("Execute unify_temporal_data() primeiro")
-        
-        if target_columns is None:
-            target_columns = ['valor_total', 'num_pedidos', 'valor_medio']
-        
-        # Preparar features
-        feature_cols = [
-            'temperatura', 'umidade', 'chuva', 'vento', 'pressao',
-            'dia_semana', 'mes', 'dia_mes', 'trimestre', 'fim_semana'
-        ]
-        
-        available_features = [col for col in feature_cols if col in self.unified_data.columns]
-        X = self.unified_data[available_features].fillna(0)
-        
-        # Treinar modelo para cada target
-        for target in target_columns:
-            if target not in self.unified_data.columns:
-                print(f"  ⚠️ Target '{target}' não encontrado, pulando...")
-                continue
-                
-            print(f"  Treinando modelo para '{target}'...")
+        if not modelos_bootstrap:
+            return None
             
-            y = self.unified_data[target].fillna(0)
-            
-            # Dividir dados
-            X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=0.2, random_state=42
-            )
-            
-            # Testar múltiplos modelos
-            models = {
-                'RandomForest': RandomForestRegressor(n_estimators=100, random_state=42),
-                'GradientBoosting': GradientBoostingRegressor(random_state=42),
-                'LinearRegression': LinearRegression()
-            }
-            
-            best_model = None
-            best_score = -np.inf
-            
-            for model_name, model in models.items():
-                model.fit(X_train, y_train)
-                score = model.score(X_test, y_test)
-                
-                if score > best_score:
-                    best_score = score
-                    best_model = model
-            
-            self.predictive_models[target] = {
-                'model': best_model,
-                'score': best_score,
-                'features': available_features
-            }
-            
-            print(f"    ✅ Melhor modelo para '{target}': R² = {best_score:.3f}")
+        # Verificar se pelo menos um modelo tem feature_importances_
+        tem_importancia = any(self._modelo_tem_feature_importance(m) for m in modelos_bootstrap)
         
-        print("✅ Treinamento de modelos concluído!")
-        return self.predictive_models
-    
-    def predict_future(self, days_ahead=7):
-        """
-        Faz predições para os próximos dias.
-        """
-        print(f"🔮 Fazendo predições para os próximos {days_ahead} dias...")
-        
-        if not self.predictive_models:
-            raise ValueError("Execute train_predictive_models() primeiro")
-        
-        # Gerar datas futuras
-        last_date = self.unified_data['data'].max()
-        future_dates = pd.date_range(
-            start=last_date + timedelta(days=1),
-            periods=days_ahead,
-            freq='D'
-        )
-        
-        # Gerar dados climáticos sintéticos para o futuro
-        future_weather = self.generate_weather_data(
-            future_dates[0], future_dates[-1]
-        )
-        
-        # Preparar features futuras
-        future_data = future_weather.copy()
-        future_data['dia_semana'] = future_data['data'].dt.dayofweek
-        future_data['mes'] = future_data['data'].dt.month
-        future_data['dia_mes'] = future_data['data'].dt.day
-        future_data['trimestre'] = future_data['data'].dt.quarter
-        future_data['fim_semana'] = (future_data['dia_semana'] >= 5).astype(int)
-        
-        # Fazer predições
-        predictions = {'data': future_dates}
-        
-        for target, model_info in self.predictive_models.items():
-            model = model_info['model']
-            features = model_info['features']
-            
-            X_future = future_data[features].fillna(0)
-            pred = model.predict(X_future)
-            predictions[f'{target}_pred'] = pred
-        
-        predictions_df = pd.DataFrame(predictions)
-        print("✅ Predições realizadas!")
-        return predictions_df
-    
-    def generate_report(self):
-        """
-        Gera relatório completo da análise.
-        """
-        print("📊 Gerando relatório de análise...")
-        
-        if self.unified_data is None:
-            raise ValueError("Execute o pipeline completo primeiro")
-        
-        # Estatísticas básicas
-        report = {
-            'resumo_dados': {
-                'total_registros': len(self.unified_data),
-                'periodo_analise': f"{self.unified_data['data'].min()} a {self.unified_data['data'].max()}",
-                'anomalias_detectadas': self.unified_data['is_anomalia'].sum(),
-                'taxa_anomalias': f"{self.unified_data['is_anomalia'].mean()*100:.1f}%"
-            },
-            'metricas_negocio': {},
-            'performance_modelos': {},
-            'insights': []
-        }
-        
-        # Métricas de negócio
-        for col in ['valor_total', 'num_pedidos', 'valor_medio']:
-            if col in self.unified_data.columns:
-                report['metricas_negocio'][col] = {
-                    'media': self.unified_data[col].mean(),
-                    'mediana': self.unified_data[col].median(),
-                    'desvio_padrao': self.unified_data[col].std(),
-                    'min': self.unified_data[col].min(),
-                    'max': self.unified_data[col].max()
-                }
-        
-        # Performance dos modelos
-        for target, model_info in self.predictive_models.items():
-            report['performance_modelos'][target] = {
-                'r2_score': model_info['score'],
-                'features_utilizadas': len(model_info['features'])
-            }
-        
-        # Insights automáticos
-        if 'valor_total' in self.unified_data.columns:
-            weekend_avg = self.unified_data[self.unified_data['fim_semana'] == 1]['valor_total'].mean()
-            weekday_avg = self.unified_data[self.unified_data['fim_semana'] == 0]['valor_total'].mean()
-            
-            if weekend_avg > weekday_avg * 1.1:
-                report['insights'].append("💡 Vendas são significativamente maiores nos fins de semana")
-            elif weekday_avg > weekend_avg * 1.1:
-                report['insights'].append("💡 Vendas são maiores durante a semana")
-        
-        # Correlação com clima
-        if 'temperatura' in self.unified_data.columns and 'valor_total' in self.unified_data.columns:
-            corr = self.unified_data['temperatura'].corr(self.unified_data['valor_total'])
-            if abs(corr) > 0.3:
-                direction = "positiva" if corr > 0 else "negativa"
-                report['insights'].append(f"🌡️ Correlação {direction} entre temperatura e vendas (r={corr:.2f})")
-        
-        print("✅ Relatório gerado!")
-        return report
-    
-    def visualize_results(self):
-        """
-        Cria visualizações dos resultados.
-        """
-        print("📈 Criando visualizações...")
-        
-        if self.unified_data is None:
+        if not tem_importancia:
             return None
         
-        # Configurar subplots
-        fig = make_subplots(
-            rows=2, cols=2,
-            subplot_titles=[
-                'Série Temporal com Anomalias',
-                'Distribuição de Anomalias',
-                'Correlação Clima vs Negócios',
-                'Predições Futuras'
-            ],
-            specs=[[{"secondary_y": True}, {"type": "bar"}],
-                   [{"type": "scatter"}, {"secondary_y": True}]]
+        # Coletar importâncias de todos os modelos bootstrap
+        importancias_bootstrap = []
+        for modelo in modelos_bootstrap:
+            if self._modelo_tem_feature_importance(modelo):
+                importancias_bootstrap.append(modelo.feature_importances_)
+        
+        if not importancias_bootstrap:
+            return None
+        
+        # Calcular estatísticas da importância
+        importancias_array = np.array(importancias_bootstrap)
+        importancia_media = np.mean(importancias_array, axis=0)
+        importancia_std = np.std(importancias_array, axis=0)
+        
+        # Mapear para nomes das features
+        importancia_dict = {}
+        for i, feature_name in enumerate(self.feature_names):
+            importancia_dict[feature_name] = {
+                'media': importancia_media[i],
+                'std': importancia_std[i]
+            }
+        
+        return importancia_dict
+    
+    def _agregar_importancia_por_categoria(self, importancia_dict):
+        """
+        Agrega a importância das features por categoria solicitada:
+        - dia_semana
+        - temperatura (temp_min + temp_media + temp_max)
+        - chuva
+        - radiacao
+        """
+        if not importancia_dict:
+            return None
+        
+        categorias = {
+            'dia_semana': 0.0,
+            'temperatura': 0.0,
+            'chuva': 0.0,
+            'radiacao': 0.0
+        }
+        
+        # Mapear features para categorias
+        for feature, valores in importancia_dict.items():
+            if feature == 'dia_semana':
+                categorias['dia_semana'] = valores['media']
+            elif feature in ['temp_min', 'temp_media', 'temp_max']:
+                categorias['temperatura'] += valores['media']
+            elif feature == 'chuva':
+                categorias['chuva'] = valores['media']
+            elif feature == 'radiacao':
+                categorias['radiacao'] = valores['media']
+        
+        # Normalizar para que soma seja 100%
+        total = sum(categorias.values())
+        if total > 0:
+            for categoria in categorias:
+                categorias[categoria] = (categorias[categoria] / total) * 100
+        
+        return categorias
+    
+    def criar_modelos_base(self):
+        """
+        Cria diferentes modelos para o ensemble
+        """
+        modelos = {
+            'LinearRegression': LinearRegression(),
+            'Ridge': Ridge(alpha=1.0, random_state=self.config['random_state']),
+            'Lasso': Lasso(alpha=1.0, random_state=self.config['random_state']),
+            'ElasticNet': ElasticNet(alpha=1.0, l1_ratio=0.5, random_state=self.config['random_state']),
+            'RandomForest': RandomForestRegressor(
+                n_estimators=100, max_depth=10, min_samples_split=5,
+                min_samples_leaf=2, random_state=self.config['random_state'], n_jobs=-1
+            ),
+            'ExtraTrees': ExtraTreesRegressor(
+                n_estimators=100, max_depth=10, min_samples_split=5,
+                min_samples_leaf=2, random_state=self.config['random_state'], n_jobs=-1
+            ),
+            'GradientBoosting': GradientBoostingRegressor(
+                n_estimators=100, max_depth=6, learning_rate=0.1,
+                random_state=self.config['random_state']
+            ),
+            'SVR': SVR(kernel='rbf', C=1.0, gamma='scale'),
+            'MLP': MLPRegressor(
+                hidden_layer_sizes=(50, 25), max_iter=500,
+                random_state=self.config['random_state'], early_stopping=True
+            )
+        }
+        
+        # Adicionar modelos avançados se disponíveis
+        if XGBOOST_AVAILABLE:
+            modelos['XGBoost'] = xgb.XGBRegressor(
+                n_estimators=100, max_depth=6, learning_rate=0.1,
+                random_state=self.config['random_state'], n_jobs=-1, verbosity=0
+            )
+        
+        if LIGHTGBM_AVAILABLE:
+            modelos['LightGBM'] = lgb.LGBMRegressor(
+                n_estimators=100, max_depth=6, learning_rate=0.1,
+                random_state=self.config['random_state'], verbose=-1, n_jobs=-1
+            )
+        
+        return modelos
+    
+    def bootstrap_training(self, X_train, y_train, modelo, nome_modelo):
+        """
+        Treina modelo usando Bootstrap resampling
+        """
+        n_samples = len(X_train)
+        sample_size = int(n_samples * self.config['bootstrap_sample_size'])
+        
+        bootstrap_predictions = []
+        bootstrap_scores_rmse = []
+        bootstrap_scores_r2 = []
+        
+        print(f"   🔄 Bootstrap para {nome_modelo}: {self.config['n_bootstrap']} iterações")
+        
+        for i in range(self.config['n_bootstrap']):
+            # Criar amostra bootstrap
+            indices = resample(range(n_samples), replace=True, n_samples=sample_size, 
+                             random_state=self.config['random_state'] + i)
+            
+            X_bootstrap = X_train.iloc[indices]
+            y_bootstrap = y_train.iloc[indices]
+            
+            # Treinar modelo
+            modelo_clone = sklearn.base.clone(modelo)
+            modelo_clone.fit(X_bootstrap, y_bootstrap)
+            
+            # Avaliar no conjunto out-of-bag (OOB)
+            oob_indices = list(set(range(n_samples)) - set(indices))
+            if len(oob_indices) > 0:
+                X_oob = X_train.iloc[oob_indices]
+                y_oob = y_train.iloc[oob_indices]
+                
+                y_pred_oob = modelo_clone.predict(X_oob)
+                
+                rmse = np.sqrt(mean_squared_error(y_oob, y_pred_oob))
+                r2 = r2_score(y_oob, y_pred_oob)
+                
+                bootstrap_scores_rmse.append(rmse)
+                bootstrap_scores_r2.append(r2)
+            
+            bootstrap_predictions.append(modelo_clone)
+        
+        # Estatísticas do Bootstrap
+        rmse_mean = np.mean(bootstrap_scores_rmse)
+        rmse_std = np.std(bootstrap_scores_rmse)
+        r2_mean = np.mean(bootstrap_scores_r2)
+        r2_std = np.std(bootstrap_scores_r2)
+        
+        # Intervalos de confiança (95%)
+        rmse_ci_lower = np.percentile(bootstrap_scores_rmse, 2.5)
+        rmse_ci_upper = np.percentile(bootstrap_scores_rmse, 97.5)
+        r2_ci_lower = np.percentile(bootstrap_scores_r2, 2.5)
+        r2_ci_upper = np.percentile(bootstrap_scores_r2, 97.5)
+        
+        return {
+            'modelos': bootstrap_predictions,
+            'rmse_mean': rmse_mean,
+            'rmse_std': rmse_std,
+            'rmse_ci': (rmse_ci_lower, rmse_ci_upper),
+            'r2_mean': r2_mean,
+            'r2_std': r2_std,
+            'r2_ci': (r2_ci_lower, r2_ci_upper)
+        }
+    
+    def treinar(self, df):
+        """
+        Treinamento completo do modelo com Bootstrap
+        """
+        print("🚀 Iniciando treinamento com Bootstrap resampling...")
+        
+        # Preparar features específicas
+        df_preparado = self.preparar_features(df)
+        
+        # Separar features e target
+        feature_cols = ['dia_semana', 'temp_min', 'temp_media', 'temp_max', 'chuva', 'radiacao']
+        X = df_preparado[feature_cols]
+        y = df_preparado['valor_total']
+        
+        self.feature_names = feature_cols
+        
+        # Divisão temporal dos dados
+        split_idx = int(len(X) * (1 - self.config['test_size']))
+        X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+        y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+        
+        print(f"📊 Divisão dos dados - Treino: {len(X_train)}, Teste: {len(X_test)}")
+        
+        # Normalização dos dados
+        self.scaler = self._create_scaler()
+        X_train_scaled = pd.DataFrame(
+            self.scaler.fit_transform(X_train),
+            columns=X_train.columns,
+            index=X_train.index
+        )
+        X_test_scaled = pd.DataFrame(
+            self.scaler.transform(X_test),
+            columns=X_test.columns,
+            index=X_test.index
         )
         
-        # Série temporal com anomalias
-        if 'valor_total' in self.unified_data.columns:
-            fig.add_trace(
-                go.Scatter(
-                    x=self.unified_data['data'],
-                    y=self.unified_data['valor_total'],
-                    mode='lines',
-                    name='Valor Total',
-                    line=dict(color='blue')
-                ),
-                row=1, col=1
-            )
+        # Criar e treinar modelos com Bootstrap
+        base_models = self.criar_modelos_base()
+        self.bootstrap_models = {}
+        self.metricas_finais = {}
+        self.importancia_features = {}  # Resetar importâncias
+        
+        for nome, modelo in base_models.items():
+            print(f"\n🔧 Treinando {nome} com Bootstrap...")
             
-            # Destacar anomalias
-            anomalies = self.unified_data[self.unified_data['is_anomalia'] == 1]
-            if len(anomalies) > 0:
-                fig.add_trace(
-                    go.Scatter(
-                        x=anomalies['data'],
-                        y=anomalies['valor_total'],
-                        mode='markers',
-                        name='Anomalias',
-                        marker=dict(color='red', size=8, symbol='x')
-                    ),
-                    row=1, col=1
+            try:
+                # Treinar com Bootstrap
+                resultado_bootstrap = self.bootstrap_training(
+                    X_train_scaled, y_train, modelo, nome
                 )
+                
+                self.bootstrap_models[nome] = resultado_bootstrap['modelos']
+                
+                # Calcular importância das features
+                importancia_raw = self._calcular_importancia_features(
+                    resultado_bootstrap['modelos'], nome
+                )
+                importancia_agregada = self._agregar_importancia_por_categoria(importancia_raw)
+                self.importancia_features[nome] = importancia_agregada
+                
+                # Fazer predições no conjunto de teste usando ensemble dos modelos bootstrap
+                y_pred_test_ensemble = np.mean([
+                    m.predict(X_test_scaled) for m in resultado_bootstrap['modelos']
+                ], axis=0)
+                
+                # Calcular métricas finais no conjunto de teste
+                rmse_test = np.sqrt(mean_squared_error(y_test, y_pred_test_ensemble))
+                r2_test = r2_score(y_test, y_pred_test_ensemble)
+                
+                self.metricas_finais[nome] = {
+                    'bootstrap_rmse_mean': resultado_bootstrap['rmse_mean'],
+                    'bootstrap_rmse_std': resultado_bootstrap['rmse_std'],
+                    'bootstrap_rmse_ci': resultado_bootstrap['rmse_ci'],
+                    'bootstrap_r2_mean': resultado_bootstrap['r2_mean'],
+                    'bootstrap_r2_std': resultado_bootstrap['r2_std'],
+                    'bootstrap_r2_ci': resultado_bootstrap['r2_ci'],
+                    'test_rmse': rmse_test,
+                    'test_r2': r2_test
+                }
+                
+                print(f"  ✅ Bootstrap RMSE: {resultado_bootstrap['rmse_mean']:.2f} (±{resultado_bootstrap['rmse_std']:.2f})")
+                print(f"     IC 95%: [{resultado_bootstrap['rmse_ci'][0]:.2f}, {resultado_bootstrap['rmse_ci'][1]:.2f}]")
+                print(f"  ✅ Bootstrap R²: {resultado_bootstrap['r2_mean']:.3f} (±{resultado_bootstrap['r2_std']:.3f})")
+                print(f"     IC 95%: [{resultado_bootstrap['r2_ci'][0]:.3f}, {resultado_bootstrap['r2_ci'][1]:.3f}]")
+                print(f"  📊 Teste Final - RMSE: {rmse_test:.2f}, R²: {r2_test:.3f}")
+                
+                # Mostrar importância das features se disponível
+                if importancia_agregada:
+                    print(f"  🎯 Importância das Features:")
+                    for categoria, valor in importancia_agregada.items():
+                        print(f"     {categoria}: {valor:.1f}%")
+                
+            except Exception as e:
+                print(f"  ❌ Erro ao treinar {nome}: {str(e)}")
         
-        # Distribuição de anomalias por dia da semana
-        if 'dia_semana' in self.unified_data.columns:
-            anomaly_by_day = self.unified_data.groupby('dia_semana')['is_anomalia'].sum()
-            dias = ['Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb', 'Dom']
-            
-            fig.add_trace(
-                go.Bar(
-                    x=dias,
-                    y=anomaly_by_day.values,
-                    name='Anomalias por Dia',
-                    marker_color='orange'
-                ),
-                row=1, col=2
-            )
+        # Criar ensemble final
+        self._criar_ensemble_final()
         
-        # Correlação clima vs negócios
-        if all(col in self.unified_data.columns for col in ['temperatura', 'valor_total']):
-            fig.add_trace(
-                go.Scatter(
-                    x=self.unified_data['temperatura'],
-                    y=self.unified_data['valor_total'],
-                    mode='markers',
-                    name='Temp vs Vendas',
-                    marker=dict(color='green', opacity=0.6)
-                ),
-                row=2, col=1
-            )
+        print("\n✅ Treinamento concluído!")
+        return self.metricas_finais
+    
+    def _create_scaler(self):
+        """Cria o normalizador apropriado"""
+        if self.config['scaling_method'] == 'standard':
+            return StandardScaler()
+        elif self.config['scaling_method'] == 'minmax':
+            return MinMaxScaler()
+        elif self.config['scaling_method'] == 'robust':
+            return RobustScaler()
+        else:
+            return StandardScaler()
+    
+    def _criar_ensemble_final(self):
+        """
+        Cria ensemble com os melhores modelos baseado no R² do teste
+        """
+        if len(self.metricas_finais) < 2:
+            return
         
-        # Layout
-        fig.update_layout(
-            height=800,
-            title_text="Dashboard de Análise de Negócios",
-            showlegend=True
+        # Selecionar os 3 melhores modelos baseados no R² do teste
+        sorted_models = sorted(
+            self.metricas_finais.items(), 
+            key=lambda x: x[1]['test_r2'], 
+            reverse=True
+        )[:3]
+        
+        self.ensemble_selecionado = [nome for nome, _ in sorted_models]
+        
+        print(f"\n🎯 Ensemble criado com os melhores modelos: {self.ensemble_selecionado}")
+        print("   Baseado nas métricas de R² no conjunto de teste")
+    
+    def _calcular_importancia_ensemble(self):
+        """
+        Calcula a importância média das features do ensemble
+        """
+        if not hasattr(self, 'ensemble_selecionado') or not self.ensemble_selecionado:
+            return None
+        
+        importancias_ensemble = {}
+        for categoria in ['dia_semana', 'temperatura', 'chuva', 'radiacao']:
+            importancias_ensemble[categoria] = 0.0
+        
+        # Média ponderada das importâncias dos modelos do ensemble
+        for nome_modelo in self.ensemble_selecionado:
+            if nome_modelo in self.importancia_features and self.importancia_features[nome_modelo]:
+                peso = 1.0 / len(self.ensemble_selecionado)  # Peso igual para todos
+                for categoria, valor in self.importancia_features[nome_modelo].items():
+                    importancias_ensemble[categoria] += valor * peso
+        
+        return importancias_ensemble
+    
+    def prever(self, dados_futuros, usar_ensemble=True, retornar_intervalo=True):
+        """
+        Faz predições para dados futuros com intervalos de confiança
+        """
+        # Preparar dados
+        dados_preparados = self.preparar_features(dados_futuros, modo_treino=False)
+        X_futuro = dados_preparados[self.feature_names]
+        X_futuro_scaled = pd.DataFrame(
+            self.scaler.transform(X_futuro),
+            columns=X_futuro.columns,
+            index=X_futuro.index
         )
         
-        print("✅ Visualizações criadas!")
-        return fig
+        if usar_ensemble and hasattr(self, 'ensemble_selecionado'):
+            # Usar ensemble dos melhores modelos
+            todas_predicoes = []
+            
+            for nome_modelo in self.ensemble_selecionado:
+                modelos_bootstrap = self.bootstrap_models[nome_modelo]
+                # Predições de todos os modelos bootstrap
+                predicoes_modelo = np.array([
+                    m.predict(X_futuro_scaled) for m in modelos_bootstrap
+                ])
+                todas_predicoes.extend(predicoes_modelo)
+            
+            todas_predicoes = np.array(todas_predicoes)
+            
+            # Calcular predição média e intervalos
+            predicao_media = np.mean(todas_predicoes, axis=0)
+            predicao_lower = np.percentile(todas_predicoes, 2.5, axis=0)
+            predicao_upper = np.percentile(todas_predicoes, 97.5, axis=0)
+            
+            print(f"🔮 Predições feitas usando Ensemble: {self.ensemble_selecionado}")
+            
+        else:
+            # Usar o melhor modelo individual
+            melhor_modelo = max(self.metricas_finais.items(), 
+                              key=lambda x: x[1]['test_r2'])
+            nome_modelo = melhor_modelo[0]
+            modelos_bootstrap = self.bootstrap_models[nome_modelo]
+            
+            # Predições de todos os modelos bootstrap
+            todas_predicoes = np.array([
+                m.predict(X_futuro_scaled) for m in modelos_bootstrap
+            ])
+            
+            predicao_media = np.mean(todas_predicoes, axis=0)
+            predicao_lower = np.percentile(todas_predicoes, 2.5, axis=0)
+            predicao_upper = np.percentile(todas_predicoes, 97.5, axis=0)
+            
+            print(f"🔮 Predições feitas usando {nome_modelo}")
+        
+        if retornar_intervalo:
+            return {
+                'predicao': predicao_media,
+                'intervalo_inferior': predicao_lower,
+                'intervalo_superior': predicao_upper
+            }
+        else:
+            return predicao_media
+    
+    def gerar_relatorio_completo(self):
+        """
+        Gera relatório detalhado com foco em RMSE, R² e importância das features
+        """
+        relatorio = {
+            'configuracao': {
+                'n_bootstrap': self.config['n_bootstrap'],
+                'bootstrap_sample_size': self.config['bootstrap_sample_size'],
+                'test_size': self.config['test_size'],
+                'features_utilizadas': self.feature_names
+            },
+            'metricas_por_modelo': self.metricas_finais,
+            'melhor_modelo': max(
+                self.metricas_finais.items(), 
+                key=lambda x: x[1]['test_r2']
+            ),
+            'ensemble_selecionado': self.ensemble_selecionado if hasattr(self, 'ensemble_selecionado') else None,
+            'importancia_features': self.importancia_features,
+            'importancia_ensemble': self._calcular_importancia_ensemble()
+        }
+        
+        return relatorio
+    
+    def salvar_modelo(self, caminho='modelo_vendas_bootstrap.pkl'):
+        """Salva o modelo completo"""
+        modelo_data = {
+            'bootstrap_models': self.bootstrap_models,
+            'scaler': self.scaler,
+            'feature_names': self.feature_names,
+            'config': self.config,
+            'metricas_finais': self.metricas_finais,
+            'ensemble_selecionado': self.ensemble_selecionado if hasattr(self, 'ensemble_selecionado') else None,
+            'importancia_features': self.importancia_features
+        }
+        
+        joblib.dump(modelo_data, caminho)
+        print(f"✅ Modelo salvo em: {caminho}")
+    
+    @classmethod
+    def carregar_modelo(cls, caminho='modelo_vendas_bootstrap.pkl'):
+        """Carrega modelo salvo"""
+        modelo_data = joblib.load(caminho)
+        
+        instance = cls(modelo_data['config'])
+        instance.bootstrap_models = modelo_data['bootstrap_models']
+        instance.scaler = modelo_data['scaler']
+        instance.feature_names = modelo_data['feature_names']
+        instance.metricas_finais = modelo_data['metricas_finais']
+        if 'ensemble_selecionado' in modelo_data:
+            instance.ensemble_selecionado = modelo_data['ensemble_selecionado']
+        if 'importancia_features' in modelo_data:
+            instance.importancia_features = modelo_data['importancia_features']
+        
+        print(f"✅ Modelo carregado de: {caminho}")
+        return instance
 
-# Exemplo de uso completo
-def exemplo_completo():
-    """
-    Demonstra o uso completo do pipeline.
-    """
-    print("🚀 Iniciando exemplo completo do pipeline...")
-    
-    # Criar dados sintéticos para demonstração
+# Importar sklearn.base para o clone
+import sklearn.base
+
+# Função para criar dados sintéticos de exemplo
+def criar_dados_exemplo():
+    """Cria dados sintéticos para demonstração"""
     np.random.seed(42)
-    dates = pd.date_range('2024-01-01', '2024-06-30', freq='D')
+    dates = pd.date_range('2023-01-01', '2024-06-30', freq='D')
     
-    operational_data = pd.DataFrame({
-        'Data': dates,
-        'Valor Total': np.random.normal(50000, 15000, len(dates)),
-        'Número de Pedidos': np.random.poisson(100, len(dates)),
-        'Valor Médio': np.random.normal(500, 100, len(dates))
-    })
+    dados = []
+    for i, date in enumerate(dates):
+        # Padrões sazonais e semanais
+        dia_semana = date.weekday()
+        dia_ano = date.dayofyear
+        
+        # Vendas base com padrões
+        vendas_base = 50000
+        if dia_semana >= 5:  # Fins de semana
+            vendas_base *= 1.3
+        
+        # Efeito da temperatura
+        temp_base = 25 + 10 * np.sin(2 * np.pi * dia_ano / 365.25)
+        temp_media = temp_base + np.random.normal(0, 3)
+        temp_min = temp_media - np.random.uniform(3, 7)
+        temp_max = temp_media + np.random.uniform(3, 7)
+        
+        # Vendas aumentam com temperatura moderada (20-28°C)
+        if 20 <= temp_media <= 28:
+            vendas_base *= 1.1
+        elif temp_media > 32 or temp_media < 15:
+            vendas_base *= 0.9
+        
+        # Efeito da chuva
+        chuva = max(0, np.random.exponential(2) if np.random.random() < 0.3 else 0)
+        if chuva > 10:
+            vendas_base *= 0.8
+        elif 1 < chuva <= 10:
+            vendas_base *= 0.95
+        
+        # Radiação solar (simulada)
+        radiacao = max(10, 25 + 10 * np.sin(2 * np.pi * dia_ano / 365.25) + np.random.normal(0, 5))
+        
+        # Vendas finais com ruído
+        vendas = vendas_base * (1 + np.random.normal(0, 0.1))
+        
+        dados.append({
+            'data': date,
+            'valor_total': vendas,
+            'temp_min': temp_min,
+            'temp_media': temp_media,
+            'temp_max': temp_max,
+            'precipitacao_total': chuva,
+            'radiacao': radiacao
+        })
     
-    # Adicionar algumas anomalias intencionais
-    anomaly_indices = np.random.choice(len(operational_data), 10, replace=False)
-    operational_data.loc[anomaly_indices, 'Valor Total'] *= 2  # Picos de venda
+    return pd.DataFrame(dados)
+
+# Exemplo de uso
+def exemplo_completo():
+    """Exemplo completo de uso do modelo com Bootstrap"""
+    print("🚀 Exemplo de Modelo com Bootstrap Resampling")
+    print("=" * 60)
     
-    # Inicializar pipeline
-    pipeline = BusinessAnalyticsPipeline()
+    # Criar ou carregar dados
+    try:
+        df = pd.read_csv('dados_unificados_completos.csv', parse_dates=['data'])
+        print("✅ Dados reais carregados")
+    except FileNotFoundError:
+        print("⚠️ Criando dados sintéticos para demonstração...")
+        df = criar_dados_exemplo()
     
-    # Executar pipeline completo
-    pipeline.load_operational_data(operational_data)
-    pipeline.unify_temporal_data()
-    anomalies = pipeline.detect_anomalies()
-    models = pipeline.train_predictive_models()
-    predictions = pipeline.predict_future(days_ahead=14)
-    report = pipeline.generate_report()
+    # Configurar modelo
+    config = {
+        'test_size': 0.2,
+        'random_state': 42,
+        'n_bootstrap': 100,  # 100 iterações bootstrap
+        'bootstrap_sample_size': 0.8,  # 80% do tamanho original em cada amostra
+        'scaling_method': 'standard'
+    }
     
-    print("\n" + "="*50)
-    print("📋 RELATÓRIO FINAL")
-    print("="*50)
+    # Criar e treinar modelo
+    modelo = ModeloVendasBootstrap(config)
+    metricas = modelo.treinar(df)
     
-    print(f"\n📊 Resumo dos Dados:")
-    for key, value in report['resumo_dados'].items():
-        print(f"  {key}: {value}")
+    # Gerar relatório
+    relatorio = modelo.gerar_relatorio_completo()
     
-    print(f"\n🤖 Performance dos Modelos:")
-    for target, metrics in report['performance_modelos'].items():
-        print(f"  {target}: R² = {metrics['r2_score']:.3f}")
+    print("\n" + "="*60)
+    print("📊 RELATÓRIO FINAL - MÉTRICAS RMSE e R²")
+    print("="*60)
     
-    print(f"\n💡 Insights:")
-    for insight in report['insights']:
-        print(f"  {insight}")
+    print(f"\n🎯 Melhor Modelo: {relatorio['melhor_modelo'][0]}")
+    melhor_metricas = relatorio['melhor_modelo'][1]
+    print(f"   RMSE (Bootstrap): {melhor_metricas['bootstrap_rmse_mean']:.2f} ± {melhor_metricas['bootstrap_rmse_std']:.2f}")
+    print(f"   R² (Bootstrap): {melhor_metricas['bootstrap_r2_mean']:.3f} ± {melhor_metricas['bootstrap_r2_std']:.3f}")
+    print(f"   RMSE (Teste Final): {melhor_metricas['test_rmse']:.2f}")
+    print(f"   R² (Teste Final): {melhor_metricas['test_r2']:.3f}")
     
-    print(f"\n🔮 Predições (próximos 7 dias):")
-    if len(predictions) > 0:
-        print(predictions.head(7).to_string(index=False))
+    print(f"\n📈 Todos os Modelos Treinados:")
+    for nome, metricas in relatorio['metricas_por_modelo'].items():
+        print(f"\n   {nome}:")
+        print(f"      RMSE: {metricas['test_rmse']:.2f}")
+        print(f"      R²: {metricas['test_r2']:.3f}")
+        print(f"      IC 95% R²: [{metricas['bootstrap_r2_ci'][0]:.3f}, {metricas['bootstrap_r2_ci'][1]:.3f}]")
     
-    return pipeline, report, predictions
+    print(f"\n🔧 Features Utilizadas: {', '.join(relatorio['configuracao']['features_utilizadas'])}")
+    
+    # Mostrar importância das features do ensemble
+    print("\n" + "="*60)
+    print("🎯 IMPORTÂNCIA DAS FEATURES")
+    print("="*60)
+    
+    if relatorio['importancia_ensemble']:
+        print("\n📊 Importância das Features do Ensemble:")
+        for categoria, valor in relatorio['importancia_ensemble'].items():
+            print(f"   {categoria.capitalize()}: {valor:.1f}%")
+        
+        # Ranking das features
+        importancia_sorted = sorted(relatorio['importancia_ensemble'].items(), 
+                                   key=lambda x: x[1], reverse=True)
+        print(f"\n🏆 Ranking de Importância:")
+        for i, (categoria, valor) in enumerate(importancia_sorted, 1):
+            print(f"   {i}º {categoria.capitalize()}: {valor:.1f}%")
+    
+    # Mostrar importância por modelo individual
+    print(f"\n📋 Importância por Modelo Individual:")
+    for nome_modelo, importancia in relatorio['importancia_features'].items():
+        if importancia:
+            print(f"\n   {nome_modelo}:")
+            for categoria, valor in importancia.items():
+                print(f"      {categoria}: {valor:.1f}%")
+    
+    # Fazer predições para próximos dias
+    print("\n🔮 Fazendo predições para os próximos 7 dias...")
+    
+    # Criar dados futuros de exemplo
+    ultimo_dia = df['data'].max()
+    datas_futuras = pd.date_range(ultimo_dia + timedelta(days=1), periods=7, freq='D')
+    
+    dados_futuros = []
+    for data in datas_futuras:
+        dados_futuros.append({
+            'data': data,
+            'temp_min': np.random.uniform(18, 22),
+            'temp_media': np.random.uniform(23, 28),
+            'temp_max': np.random.uniform(28, 35),
+            'precipitacao_total': max(0, np.random.exponential(2) if np.random.random() < 0.3 else 0),
+            'radiacao': np.random.uniform(20, 30)
+        })
+    
+    df_futuro = pd.DataFrame(dados_futuros)
+    
+    # Fazer predições com intervalos
+    resultados = modelo.prever(df_futuro, usar_ensemble=True, retornar_intervalo=True)
+    
+    print("\nPredições com Intervalos de Confiança 95%:")
+    for i, (pred, lower, upper) in enumerate(zip(
+        resultados['predicao'], 
+        resultados['intervalo_inferior'], 
+        resultados['intervalo_superior']
+    )):
+        print(f"   Dia {i+1}: R$ {pred:,.2f} [IC: R$ {lower:,.2f} - R$ {upper:,.2f}]")
+    
+    # Salvar modelo
+    modelo.salvar_modelo('modelo_vendas_bootstrap_final.pkl')
+    
+    print("\n✅ Modelo treinado e salvo com sucesso!")
+    print("📊 Bootstrap resampling aplicado com sucesso para lidar com poucos dados")
+    print("📈 Métricas RMSE e R² calculadas com intervalos de confiança")
+    print("🎯 Importância das features calculada e agregada por categoria")
+    
+    return modelo, relatorio
 
 if __name__ == "__main__":
-    pipeline, report, predictions = exemplo_completo()
+    modelo, relatorio = exemplo_completo()
